@@ -67,7 +67,13 @@ impl DownloadManager {
     self.insert(&item).await?; self.start(item.id.clone()).await; Ok(item)
   }
   pub async fn pause(&self, id: &str) -> Result<(), String> { if let Some(control) = self.active.lock().await.get(id) { control.paused.store(true, Ordering::Release); } else { self.update_state(id, DownloadState::Paused, None).await?; } Ok(()) }
-  pub async fn resume(&self, id: &str) -> Result<(), String> { self.start(id.to_owned()).await; Ok(()) }
+  pub async fn resume(&self, id: &str) -> Result<(), String> {
+    if let Some(control) = self.active.lock().await.get(id) {
+      control.paused.store(false, Ordering::Release);
+      self.update_state(id, DownloadState::Active, None).await?;
+    } else { self.start(id.to_owned()).await; }
+    Ok(())
+  }
   pub async fn retry(&self, id: &str) -> Result<(), String> { self.start(id.to_owned()).await; Ok(()) }
   pub async fn remove(&self, id: &str) -> Result<(), String> { if let Some(control) = self.active.lock().await.get(id) { control.cancelled.store(true, Ordering::Release); } self.database.lock().await.execute("DELETE FROM downloads WHERE id=?1", params![id]).map_err(|e| e.to_string())?; Ok(()) }
   pub fn set_speed_limit(&self, value: u64) { self.speed_limit.store(value, Ordering::Release); }
@@ -101,13 +107,13 @@ impl DownloadManager {
     let target = PathBuf::from(&item.save_path); if let Some(parent) = target.parent() { tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?; }
     let temp = PathBuf::from(format!("{}.part", item.save_path));
     if item.segments > 1 { self.segmented(&item, &temp, control.clone()).await?; } else { self.single(&item, &temp, control.clone()).await?; }
-    if control.cancelled.load(Ordering::Acquire) { return Ok(()); }
+    if control.cancelled.load(Ordering::Acquire) || control.paused.load(Ordering::Acquire) { return Ok(()); }
     tokio::fs::rename(&temp, &target).await.map_err(|e| e.to_string())?; self.complete(&id).await
   }
   async fn single(&self, item: &Download, temp: &Path, control: Arc<Control>) -> Result<(), String> {
     let mut response = self.client.get(&item.url).send().await.map_err(network_error)?; if !response.status().is_success() { return Err(format!("Remote server returned HTTP {}", response.status())); }
     let mut file = tokio::fs::File::create(temp).await.map_err(|e| e.to_string())?; let mut stream = response.bytes_stream(); let mut downloaded = 0u64; let started = Instant::now(); let mut last_update = Instant::now();
-    while let Some(chunk) = stream.next().await { if control.cancelled.load(Ordering::Acquire) { return Ok(()); } while control.paused.load(Ordering::Acquire) { self.update_state(&item.id, DownloadState::Paused, None).await?; sleep(Duration::from_millis(150)).await; if control.cancelled.load(Ordering::Acquire) { return Ok(()); } } let chunk = chunk.map_err(network_error)?; file.write_all(&chunk).await.map_err(|e| e.to_string())?; downloaded += chunk.len() as u64; self.limit(chunk.len()).await; if last_update.elapsed() > Duration::from_millis(300) { self.progress(&item.id, downloaded, rate(downloaded, started), item.total_bytes).await?; last_update = Instant::now(); } }
+    while let Some(chunk) = stream.next().await { if control.cancelled.load(Ordering::Acquire) { return Ok(()); } while control.paused.load(Ordering::Acquire) { self.update_state(&item.id, DownloadState::Paused, None).await?; sleep(Duration::from_millis(150)).await; if control.cancelled.load(Ordering::Acquire) { return Ok(()); } } self.update_state(&item.id, DownloadState::Active, None).await?; let chunk = chunk.map_err(network_error)?; file.write_all(&chunk).await.map_err(|e| e.to_string())?; downloaded += chunk.len() as u64; self.limit(chunk.len()).await; if last_update.elapsed() > Duration::from_millis(300) { self.progress(&item.id, downloaded, rate(downloaded, started), item.total_bytes).await?; last_update = Instant::now(); } }
     file.flush().await.map_err(|e| e.to_string())?; self.progress(&item.id, downloaded, rate(downloaded, started), item.total_bytes).await
   }
   async fn segmented(&self, item: &Download, temp: &Path, control: Arc<Control>) -> Result<(), String> {

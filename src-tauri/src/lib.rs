@@ -33,10 +33,14 @@ pub fn run() {
     .plugin(tauri_plugin_opener::init())
     .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
     .setup(|app| {
-      let data_dir: PathBuf = app.path().app_data_dir().map_err(|e| e.to_string())?;
-      let manager = DownloadManager::new(data_dir)?;
+      let data_dir: PathBuf = app.path().app_local_data_dir()?;
+      let manager = DownloadManager::new(data_dir.clone()).map_err(std::io::Error::other)?;
       let recovery_manager = manager.clone();
-      tauri::async_runtime::spawn(async move { recovery_manager.import_browser_queue(&data_dir).await; recovery_manager.recover().await; });
+      tauri::async_runtime::spawn(async move {
+        recovery_manager.import_browser_queue(&data_dir).await;
+        recovery_manager.recover().await;
+        loop { tokio::time::sleep(std::time::Duration::from_secs(2)).await; recovery_manager.import_browser_queue(&data_dir).await; }
+      });
       app.manage(manager);
       let show = MenuItemBuilder::with_id("show", "Show REA Idm Mangaer").build(app)?;
       let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
