@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::{Path, PathBuf}, sync::{Arc, atomic::{Atom
 
 use chrono::Utc;
 use futures_util::StreamExt;
-use reqwest::{header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, RANGE}, Client, StatusCode};
+use reqwest::{header::{ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE, RANGE}, Client, StatusCode};
 use rusqlite::{params, Connection};
 use serde::Serialize;
 use tokio::{io::{AsyncSeekExt, AsyncWriteExt}, sync::Mutex, task::JoinSet, time::sleep};
@@ -28,6 +28,7 @@ pub struct DashboardStats { pub active: usize, pub queued: usize, pub complete: 
 
 struct Control { paused: AtomicBool, cancelled: AtomicBool }
 impl Control { fn new() -> Self { Self { paused: AtomicBool::new(false), cancelled: AtomicBool::new(false) } } }
+struct RemoteMetadata { length: u64, ranges: bool, file_name: Option<String> }
 
 #[derive(Clone)]
 pub struct DownloadManager {
@@ -98,21 +99,37 @@ impl DownloadManager {
   }
   async fn run(&self, id: String, control: Arc<Control>) -> Result<(), String> {
     let mut item = self.one(&id).await?; self.update_state(&id, DownloadState::Active, None).await?;
-    let head = self.client.head(&item.url).send().await.map_err(network_error)?;
-    if !head.status().is_success() { return Err(format!("Remote server returned HTTP {}", head.status())); }
-    let length = head.headers().get(CONTENT_LENGTH).and_then(|h| h.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0);
-    let ranges = head.headers().get(ACCEPT_RANGES).and_then(|h| h.to_str().ok()).is_some_and(|v| v.eq_ignore_ascii_case("bytes"));
-    if let Some(name) = head.headers().get(CONTENT_DISPOSITION).and_then(|h| h.to_str().ok()).and_then(filename_from_disposition) { item.file_name = safe_file_name(&name); item.save_path = self.download_dir.join(&item.file_name).to_string_lossy().to_string(); }
-    item.total_bytes = length; item.resumable = ranges; item.segments = if ranges && length >= SEGMENT_THRESHOLD { ((length / SEGMENT_THRESHOLD).clamp(2, MAX_SEGMENTS as u64)) as u8 } else { 1 }; self.update_metadata(&item).await?;
-    let target = PathBuf::from(&item.save_path); if let Some(parent) = target.parent() { tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?; }
+    let remote = self.probe(&item.url).await?;
+    if let Some(name) = remote.file_name { item.file_name = safe_file_name(&name); item.save_path = self.download_dir.join(&item.file_name).to_string_lossy().to_string(); }
+    let target = self.unique_path(PathBuf::from(&item.save_path)).await?;
+    item.file_name = target.file_name().and_then(|name| name.to_str()).unwrap_or("download.bin").to_owned(); item.save_path = target.to_string_lossy().to_string();
+    item.total_bytes = remote.length; item.resumable = remote.ranges; item.segments = if remote.ranges && remote.length >= SEGMENT_THRESHOLD { ((remote.length / SEGMENT_THRESHOLD).clamp(2, MAX_SEGMENTS as u64)) as u8 } else { 1 }; self.update_metadata(&item).await?;
+    if let Some(parent) = target.parent() { tokio::fs::create_dir_all(parent).await.map_err(|e| e.to_string())?; }
     let temp = PathBuf::from(format!("{}.part", item.save_path));
     if item.segments > 1 { self.segmented(&item, &temp, control.clone()).await?; } else { self.single(&item, &temp, control.clone()).await?; }
     if control.cancelled.load(Ordering::Acquire) || control.paused.load(Ordering::Acquire) { return Ok(()); }
+    if item.total_bytes > 0 && tokio::fs::metadata(&temp).await.map_err(|e| e.to_string())?.len() != item.total_bytes { return Err("Integrity check failed: downloaded length does not match the server length.".into()); }
     tokio::fs::rename(&temp, &target).await.map_err(|e| e.to_string())?; self.complete(&id).await
   }
+  async fn probe(&self, url: &str) -> Result<RemoteMetadata, String> {
+    let head = self.client.head(url).send().await.map_err(network_error)?;
+    if head.status().is_success() { return Ok(metadata_from_headers(head.headers(), false)); }
+    let probe = self.client.get(url).header(RANGE, "bytes=0-0").send().await.map_err(network_error)?;
+    if !probe.status().is_success() && probe.status() != StatusCode::PARTIAL_CONTENT { return Err(format!("Remote server returned HTTP {} to HEAD and GET fallback", probe.status())); }
+    Ok(metadata_from_headers(probe.headers(), probe.status() == StatusCode::PARTIAL_CONTENT))
+  }
+  async fn unique_path(&self, preferred: PathBuf) -> Result<PathBuf, String> {
+    if tokio::fs::metadata(&preferred).await.is_err() { return Ok(preferred); }
+    let parent = preferred.parent().ok_or("Download destination has no parent directory.")?; let stem = preferred.file_stem().and_then(|v| v.to_str()).unwrap_or("download"); let extension = preferred.extension().and_then(|v| v.to_str());
+    for index in 1..10_000 { let name = match extension { Some(ext) => format!("{stem} ({index}).{ext}"), None => format!("{stem} ({index})") }; let candidate = parent.join(name); if tokio::fs::metadata(&candidate).await.is_err() { return Ok(candidate); } }
+    Err("Could not create a unique filename after 9,999 attempts.".into())
+  }
   async fn single(&self, item: &Download, temp: &Path, control: Arc<Control>) -> Result<(), String> {
-    let mut response = self.client.get(&item.url).send().await.map_err(network_error)?; if !response.status().is_success() { return Err(format!("Remote server returned HTTP {}", response.status())); }
-    let mut file = tokio::fs::File::create(temp).await.map_err(|e| e.to_string())?; let mut stream = response.bytes_stream(); let mut downloaded = 0u64; let started = Instant::now(); let mut last_update = Instant::now();
+    let existing = if item.resumable { tokio::fs::metadata(temp).await.map(|m| m.len()).unwrap_or(0) } else { 0 };
+    let mut request = self.client.get(&item.url); if existing > 0 { request = request.header(RANGE, format!("bytes={existing}-")); }
+    let response = request.send().await.map_err(network_error)?; if !response.status().is_success() { return Err(format!("Remote server returned HTTP {}", response.status())); }
+    let append = existing > 0 && response.status() == StatusCode::PARTIAL_CONTENT;
+    let mut file = if append { tokio::fs::OpenOptions::new().append(true).open(temp).await.map_err(|e| e.to_string())? } else { tokio::fs::File::create(temp).await.map_err(|e| e.to_string())? }; let mut stream = response.bytes_stream(); let mut downloaded = if append { existing } else { 0 }; let started = Instant::now(); let mut last_update = Instant::now();
     while let Some(chunk) = stream.next().await { if control.cancelled.load(Ordering::Acquire) { return Ok(()); } while control.paused.load(Ordering::Acquire) { self.update_state(&item.id, DownloadState::Paused, None).await?; sleep(Duration::from_millis(150)).await; if control.cancelled.load(Ordering::Acquire) { return Ok(()); } } self.update_state(&item.id, DownloadState::Active, None).await?; let chunk = chunk.map_err(network_error)?; file.write_all(&chunk).await.map_err(|e| e.to_string())?; downloaded += chunk.len() as u64; self.limit(chunk.len()).await; if last_update.elapsed() > Duration::from_millis(300) { self.progress(&item.id, downloaded, rate(downloaded, started), item.total_bytes).await?; last_update = Instant::now(); } }
     file.flush().await.map_err(|e| e.to_string())?; self.progress(&item.id, downloaded, rate(downloaded, started), item.total_bytes).await
   }
@@ -120,7 +137,7 @@ impl DownloadManager {
     let file = tokio::fs::File::create(temp).await.map_err(|e| e.to_string())?; file.set_len(item.total_bytes).await.map_err(|e| e.to_string())?; drop(file);
     let progress = Arc::new(AtomicU64::new(0)); let started = Instant::now(); let mut tasks = JoinSet::new(); let segment_size = item.total_bytes / item.segments as u64;
     for index in 0..item.segments { let start = index as u64 * segment_size; let end = if index + 1 == item.segments { item.total_bytes - 1 } else { start + segment_size - 1 }; let client = self.client.clone(); let url = item.url.clone(); let path = temp.to_path_buf(); let total = progress.clone(); let stop = control.clone(); let limit = self.speed_limit.clone(); tasks.spawn(async move { fetch_range(client, url, path, start, end, total, stop, limit).await }); }
-    while !tasks.is_empty() { if control.cancelled.load(Ordering::Acquire) { tasks.abort_all(); return Ok(()); } if control.paused.load(Ordering::Acquire) { tasks.abort_all(); self.update_state(&item.id, DownloadState::Paused, None).await?; return Ok(()); } while let Some(joined) = tasks.try_join_next() { joined.map_err(|e| e.to_string())??; } self.progress(&item.id, progress.load(Ordering::Acquire), rate(progress.load(Ordering::Acquire), started), item.total_bytes).await?; sleep(Duration::from_millis(250)).await; }
+    while !tasks.is_empty() { if control.cancelled.load(Ordering::Acquire) { tasks.abort_all(); return Ok(()); } while control.paused.load(Ordering::Acquire) { self.update_state(&item.id, DownloadState::Paused, None).await?; sleep(Duration::from_millis(150)).await; if control.cancelled.load(Ordering::Acquire) { tasks.abort_all(); return Ok(()); } } self.update_state(&item.id, DownloadState::Active, None).await?; while let Some(joined) = tasks.try_join_next() { joined.map_err(|e| e.to_string())??; } self.progress(&item.id, progress.load(Ordering::Acquire), rate(progress.load(Ordering::Acquire), started), item.total_bytes).await?; sleep(Duration::from_millis(250)).await; }
     self.progress(&item.id, item.total_bytes, rate(item.total_bytes, started), item.total_bytes).await
   }
   async fn limit(&self, bytes: usize) { let limit = self.speed_limit.load(Ordering::Acquire); if limit > 0 { sleep(Duration::from_secs_f64(bytes as f64 / limit as f64)).await; } }
@@ -132,11 +149,12 @@ impl DownloadManager {
   async fn complete(&self, id: &str) -> Result<(), String> { self.database.lock().await.execute("UPDATE downloads SET state='completed',downloaded_bytes=total_bytes,speed_bps=0,eta_seconds=NULL,error=NULL,updated_at=?2 WHERE id=?1",params![id,now()]).map_err(|e|e.to_string())?; Ok(()) }
 }
 
-async fn fetch_range(client: Client, url: String, path: PathBuf, start: u64, end: u64, total: Arc<AtomicU64>, control: Arc<Control>, speed_limit: Arc<AtomicU64>) -> Result<(), String> { let response = client.get(url).header(RANGE, format!("bytes={start}-{end}")).send().await.map_err(network_error)?; if response.status() != StatusCode::PARTIAL_CONTENT { return Err("Remote server stopped supporting ranged transfers.".to_owned()); } let mut file = tokio::fs::OpenOptions::new().write(true).open(path).await.map_err(|e|e.to_string())?; file.seek(std::io::SeekFrom::Start(start)).await.map_err(|e|e.to_string())?; let mut stream=response.bytes_stream(); while let Some(chunk)=stream.next().await { if control.cancelled.load(Ordering::Acquire) || control.paused.load(Ordering::Acquire) { return Ok(()); } let chunk=chunk.map_err(network_error)?; file.write_all(&chunk).await.map_err(|e|e.to_string())?; total.fetch_add(chunk.len() as u64,Ordering::AcqRel); let limit=speed_limit.load(Ordering::Acquire); if limit>0 { sleep(Duration::from_secs_f64(chunk.len() as f64/limit as f64)).await; } } Ok(()) }
+async fn fetch_range(client: Client, url: String, path: PathBuf, start: u64, end: u64, total: Arc<AtomicU64>, control: Arc<Control>, speed_limit: Arc<AtomicU64>) -> Result<(), String> { let response = client.get(url).header(RANGE, format!("bytes={start}-{end}")).send().await.map_err(network_error)?; if response.status() != StatusCode::PARTIAL_CONTENT { return Err("Remote server stopped supporting ranged transfers.".to_owned()); } let mut file = tokio::fs::OpenOptions::new().write(true).open(path).await.map_err(|e|e.to_string())?; file.seek(std::io::SeekFrom::Start(start)).await.map_err(|e|e.to_string())?; let mut stream=response.bytes_stream(); while let Some(chunk)=stream.next().await { while control.paused.load(Ordering::Acquire) { if control.cancelled.load(Ordering::Acquire) { return Ok(()); } sleep(Duration::from_millis(150)).await; } if control.cancelled.load(Ordering::Acquire) { return Ok(()); } let chunk=chunk.map_err(network_error)?; file.write_all(&chunk).await.map_err(|e|e.to_string())?; total.fetch_add(chunk.len() as u64,Ordering::AcqRel); let limit=speed_limit.load(Ordering::Acquire); if limit>0 { sleep(Duration::from_secs_f64(chunk.len() as f64/limit as f64)).await; } } Ok(()) }
 fn row_to_download(row: &rusqlite::Row<'_>) -> rusqlite::Result<Download> { Ok(Download { id:row.get(0)?,url:row.get(1)?,file_name:row.get(2)?,save_path:row.get(3)?,category:row.get(4)?,state:DownloadState::from(row.get::<_,String>(5)?),total_bytes:row.get::<_,i64>(6)? as u64,downloaded_bytes:row.get::<_,i64>(7)? as u64,speed_bps:row.get::<_,i64>(8)? as u64,eta_seconds:row.get::<_,Option<i64>>(9)?.map(|v|v as u64),error:row.get(10)?,created_at:row.get(11)?,updated_at:row.get(12)?,resumable:row.get::<_,i32>(13)? != 0,segments:row.get::<_,i32>(14)? as u8 }) }
 fn now() -> String { Utc::now().to_rfc3339() }
 fn rate(bytes:u64, started:Instant)->u64 { let s=started.elapsed().as_secs_f64(); if s>0.0 {(bytes as f64/s) as u64} else {0} }
 fn network_error(error:reqwest::Error)->String { if error.is_timeout() { "Connection timed out; retry is available.".into() } else { format!("Network error: {error}") } }
+fn metadata_from_headers(headers: &reqwest::header::HeaderMap, proven_ranges: bool) -> RemoteMetadata { let from_length = headers.get(CONTENT_LENGTH).and_then(|h| h.to_str().ok()).and_then(|v| v.parse().ok()).unwrap_or(0); let from_range = headers.get(CONTENT_RANGE).and_then(|h| h.to_str().ok()).and_then(|v| v.rsplit('/').next()).and_then(|v| v.parse().ok()).unwrap_or(0); RemoteMetadata { length: from_range.max(from_length), ranges: proven_ranges || headers.get(ACCEPT_RANGES).and_then(|h| h.to_str().ok()).is_some_and(|v| v.eq_ignore_ascii_case("bytes")), file_name: headers.get(CONTENT_DISPOSITION).and_then(|h| h.to_str().ok()).and_then(filename_from_disposition) } }
 fn name_from_url(url:&Url)->String { url.path_segments().and_then(|mut p|p.next_back()).filter(|s|!s.is_empty()).map(safe_file_name).unwrap_or_else(|| format!("download-{}.bin",Uuid::new_v4())) }
 fn filename_from_disposition(header:&str)->Option<String> { header.split(';').find_map(|p| p.trim().strip_prefix("filename=")).map(|v| v.trim_matches('"').to_owned()) }
 fn safe_file_name(value:&str)->String { let result:String=value.chars().map(|c|if matches!(c,'<'|'>'|':'|'"'|'/'|'\\'|'|'|'?'|'*'){'_'}else{c}).collect(); if result.is_empty(){"download.bin".into()}else{result.chars().take(180).collect()} }

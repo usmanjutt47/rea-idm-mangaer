@@ -3,8 +3,8 @@
   "name": "REA Idm Mangaer Browser Bridge",
   "version": "0.1.0",
   "description": "Sends direct downloads to the local REA Idm Mangaer application.",
-  "permissions": ["contextMenus", "nativeMessaging", "webRequest"],
+  "permissions": ["contextMenus", "nativeMessaging", "webRequest", "downloads", "storage"],
   "host_permissions": ["<all_urls>"],
-  "background": { "service_worker": "service-worker.js", "type": "module" },
-  "action": { "default_title": "REA Idm Mangaer" }
+  "background": { "service_worker": "background.chromium.js" },
+  "action": { "default_title": "REA Idm Mangaer", "default_popup": "popup.html" }
 }

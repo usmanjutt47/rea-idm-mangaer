@@ -55,8 +55,10 @@ Create an installable package with `pnpm tauri:build`. The application stores it
    ```
 
 4. Open the relevant browser’s extension page and enable Developer mode:
-   - Chrome, Edge, Brave, Opera, Vivaldi: choose **Load unpacked**, then select `extension\build`; rename `manifest.chromium.json` to `manifest.json` first.
-   - Firefox: package/load the directory with `manifest.firefox.json` renamed to `manifest.json`; use `about:debugging` for temporary developer loading. Signing is required for normal Firefox distribution.
+   - Chrome, Edge, Brave, Opera, Vivaldi: choose **Load unpacked**, then select `extension\build\chromium`.
+   - Firefox: load `extension\build\firefox` from `about:debugging` for temporary developer loading. Firefox MV3 uses a dedicated `background.scripts` process rather than Chromium's service-worker model. Signing is required for normal Firefox distribution.
+
+The extension popup contains an explicit **Automatically intercept direct downloads** switch. It is off by default. When on, browser downloads with a recognised direct-file URL are cancelled and forwarded to REA; browser flows that cannot be cancelled remain in the browser to avoid duplicate or broken site downloads.
 
 The bridge only submits direct HTTP(S) URLs. It never reads passwords or cookies and does not bypass DRM. YouTube pages are detected and clearly declined: direct, explicitly authorized media URLs may be downloaded, but protected streams, authentication-gated content, DRM, and page/video extraction are not supported. Safari is not supported because its native extension distribution and messaging model require an Apple/macOS host app, which is outside this Windows-only application.
 
@@ -65,7 +67,7 @@ To unregister the local bridge before uninstalling the app, run `./scripts/unins
 ## Safety and limitations
 
 - Downloads must be authorized by the user and lawful in their jurisdiction. Servers can disable ranges, reject HEAD, rate-limit requests, or require authentication; those cases are surfaced as failures rather than circumvented.
-- Pause for a multi-segment transfer safely stops its workers; current version restarts that transfer on resume rather than preserving partial per-segment maps. Completed records and queued crash recovery are persisted.
+- Paused transfers preserve their partial `.part` data while the app remains open; single-connection HTTP Range transfers also continue from the existing partial file after recovery. Multi-segment crash recovery currently restarts the segment plan safely instead of persisting a per-segment checkpoint map.
 - Scheduling data model and views are present, while a calendar editor and scheduled-worker trigger are planned follow-up work.
 - File previews, OS notifications, and an in-app settings screen are not yet implemented. The native notification and dialog plugins are present for the next UI phase.
 

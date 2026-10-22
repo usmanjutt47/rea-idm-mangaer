@@ -11,7 +11,8 @@
     "test:watch": "vitest",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build",
+    "tauri:build": "pnpm native-host:prepare && tauri build",
+    "native-host:prepare": "node scripts/prepare-native-host.mjs",
     "extension:build": "node scripts/build-extension.mjs",
     "check": "pnpm lint && pnpm test && pnpm build && pnpm extension:build"
   },

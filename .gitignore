@@ -10,3 +10,4 @@ src-tauri/target/
 !.env.example
 extension/build/
 release/
+src-tauri/binaries/
