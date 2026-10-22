@@ -1,0 +1,9 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "REA Idm Mangaer",
+  "version": "0.1.0",
+  "identifier": "com.rea.idm-mangaer",
+  "build": { "frontendDist": "../dist", "devUrl": "http://127.0.0.1:1420", "beforeDevCommand": "pnpm dev", "beforeBuildCommand": "pnpm build" },
+  "app": { "windows": [{ "title": "REA Idm Mangaer", "width": 1220, "height": 800, "minWidth": 900, "minHeight": 620, "center": true }], "security": { "csp": "default-src 'self'; img-src 'self' asset: https: data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; connect-src 'self' https:" } },
+  "bundle": { "active": true, "targets": "nsis", "windows": { "nsis": { "installerMode": "currentUser", "displayLanguageSelector": false } } }
+}
