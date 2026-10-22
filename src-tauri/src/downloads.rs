@@ -86,12 +86,13 @@ impl DownloadManager {
     if let Ok(contents) = std::fs::read_to_string(&processing) {
       for line in contents.lines() {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-          if let Some(url) = value.get("url").and_then(|v| v.as_str()) { let _ = self.add(url, None).await; }
+          if let Some(url) = value.get("url").and_then(|v| v.as_str()) { if !self.has_pending_url(url).await.unwrap_or(true) { let _ = self.add(url, None).await; } }
         }
       }
     }
     let _ = std::fs::remove_file(processing);
   }
+  async fn has_pending_url(&self, url: &str) -> Result<bool, String> { let db = self.database.lock().await; let count: i64 = db.query_row("SELECT COUNT(*) FROM downloads WHERE url=?1 AND state IN ('active','queued','paused','scheduled')", params![url], |row| row.get(0)).map_err(|e| e.to_string())?; Ok(count > 0) }
   async fn start(&self, id: String) {
     if self.active.lock().await.contains_key(&id) { return; }
     let control = Arc::new(Control::new()); self.active.lock().await.insert(id.clone(), control.clone());
