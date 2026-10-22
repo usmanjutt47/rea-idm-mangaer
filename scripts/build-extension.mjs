@@ -1,7 +1,8 @@
 import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const root = new URL('..', import.meta.url).pathname;
+const root = fileURLToPath(new URL('..', import.meta.url));
 const source = join(root, 'extension', 'src');
 const publicDir = join(root, 'extension', 'public');
 const out = join(root, 'extension', 'build');

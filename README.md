@@ -60,6 +60,8 @@ Create an installable package with `pnpm tauri:build`. The application stores it
 
 The bridge only submits direct HTTP(S) URLs. It never reads passwords or cookies and does not bypass DRM. YouTube pages are detected and clearly declined: direct, explicitly authorized media URLs may be downloaded, but protected streams, authentication-gated content, DRM, and page/video extraction are not supported. Safari is not supported because its native extension distribution and messaging model require an Apple/macOS host app, which is outside this Windows-only application.
 
+To unregister the local bridge before uninstalling the app, run `./scripts/uninstall-browser-bridge.ps1`, then remove the extension from each browser.
+
 ## Safety and limitations
 
 - Downloads must be authorized by the user and lawful in their jurisdiction. Servers can disable ranges, reject HEAD, rate-limit requests, or require authentication; those cases are surfaced as failures rather than circumvented.
